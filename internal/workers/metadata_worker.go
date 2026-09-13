@@ -155,6 +155,19 @@ func (w *MetadataWorker) ProcessBook(ctx context.Context, bookID, callerID uuid.
 	return nil
 }
 
+// fillField decides the new value for one metadata field. force overwrites an
+// existing value, but only with a real one — a provider that returned nothing
+// (rate-limited, or a book it doesn't hold) must never blank out metadata we
+// already have. A bulk force re-enrich once wiped title and ISBN on every book
+// whose lookup came back empty; this guard is what stops an empty merged result
+// from erasing a good record.
+func fillField(current, merged string, force bool) string {
+	if merged != "" && (force || current == "") {
+		return merged
+	}
+	return current
+}
+
 // applyMerged updates the book and its primary edition with merged provider data.
 // When force=false only empty fields are filled; when force=true all fields are overwritten.
 func (w *MetadataWorker) applyMerged(
@@ -172,10 +185,7 @@ func (w *MetadataWorker) applyMerged(
 	// ── Book-level fields ─────────────────────────────────────────────────────
 
 	fill := func(current, merged string) string {
-		if force || current == "" {
-			return merged
-		}
-		return current
+		return fillField(current, merged, force)
 	}
 
 	newTitle := fill(book.Title, fieldVal(merged.Title))
