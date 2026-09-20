@@ -134,7 +134,24 @@ func (h *ProviderHandler) LookupISBN(w http.ResponseWriter, r *http.Request) {
 	if results == nil {
 		results = []*providers.BookResult{}
 	}
+	normalizeBookResultSlices(results)
 	respond.JSON(w, http.StatusOK, results)
+}
+
+// normalizeBookResultSlices makes every result's slice fields serialise as []
+// rather than null. A nil slice marshals to null, which the web and iOS clients
+// decode as "not an array" and reject the whole record — e.g. a Google Books hit
+// with no authors ("authors": null) made the iOS scan drop the entire lookup.
+// See AGENTS.md ("Initialise slices you return as make([]T, 0)").
+func normalizeBookResultSlices(results []*providers.BookResult) {
+	for _, res := range results {
+		if res.Authors == nil {
+			res.Authors = []string{}
+		}
+		if res.Categories == nil {
+			res.Categories = []string{}
+		}
+	}
 }
 
 // LookupISBNMerged godoc
@@ -240,6 +257,7 @@ func (h *ProviderHandler) SearchBooks(w http.ResponseWriter, r *http.Request) {
 	if results == nil {
 		results = []*providers.BookResult{}
 	}
+	normalizeBookResultSlices(results)
 
 	slog.InfoContext(r.Context(), "SearchBooks handler done",
 		"query", q,
