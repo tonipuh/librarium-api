@@ -105,7 +105,9 @@ func (w *MetadataWorker) ProcessBook(ctx context.Context, bookID, callerID uuid.
 		return ErrNoUpdate // no ISBN — nothing to look up
 	}
 
-	merged, err := w.providerSvc.LookupISBNMerged(ctx, isbn)
+	// Nobody is waiting on a background refresh, so wait for every provider
+	// instead of dropping the slow ones at the scan deadline.
+	merged, err := w.providerSvc.LookupISBNMerged(providers.Unhurried(ctx), isbn)
 	if err != nil {
 		return fmt.Errorf("ISBN lookup: %w", err)
 	}

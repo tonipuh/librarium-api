@@ -218,9 +218,16 @@ func lookupBarcode(ctx context.Context, kind, code string, lookups []barcodeLook
 	// lookupOverallDeadline caps the whole lookup as well, so a scan where
 	// every provider is slow still comes back instead of waiting on HTTP
 	// timeouts.
-	var deadlineC <-chan time.Time
-	overall := time.NewTimer(lookupOverallDeadline)
-	defer overall.Stop()
+	//
+	// Neither applies to an Unhurried lookup: it waits for every provider,
+	// each still bounded by its own HTTP timeout.
+	unhurried := isUnhurried(ctx)
+	var deadlineC, overallC <-chan time.Time
+	if !unhurried {
+		overall := time.NewTimer(lookupOverallDeadline)
+		defer overall.Stop()
+		overallC = overall.C
+	}
 
 	var out []*BookResult
 	remaining := len(lookups)
@@ -233,7 +240,7 @@ func lookupBarcode(ctx context.Context, kind, code string, lookups []barcodeLook
 				out = append(out, res.book)
 			}
 			remaining--
-			if deadlineC == nil {
+			if deadlineC == nil && !unhurried {
 				deadline := time.NewTimer(isbnDeadline)
 				defer deadline.Stop()
 				deadlineC = deadline.C
@@ -242,7 +249,7 @@ func lookupBarcode(ctx context.Context, kind, code string, lookups []barcodeLook
 			slog.InfoContext(ctx, kind+" lookup deadline reached, returning partial results",
 				kind, code, "waiting_on", remaining, "results_so_far", len(out))
 			return out, statuses
-		case <-overall.C:
+		case <-overallC:
 			slog.InfoContext(ctx, kind+" lookup overall deadline reached",
 				kind, code, "waiting_on", remaining, "results_so_far", len(out))
 			return out, statuses
@@ -268,6 +275,25 @@ var lookupOverallDeadline = 10 * time.Second
 //
 // var, not const, so tests can shrink it rather than sleeping real seconds.
 var isbnDeadline = 3 * time.Second
+
+type unhurriedKey struct{}
+
+// Unhurried marks ctx as a lookup nobody is waiting on, such as a background
+// enrichment batch, so ISBN and UPC lookups wait for every provider rather
+// than cutting the slow ones off at isbnDeadline.
+//
+// The deadlines are for a scan at the shelf. In a batch they drop exactly the
+// providers that pace themselves: several batches share Finna's one request a
+// second, its queue passes three seconds at once, and Finna then never
+// contributed to a batch at all.
+func Unhurried(ctx context.Context) context.Context {
+	return context.WithValue(ctx, unhurriedKey{}, true)
+}
+
+func isUnhurried(ctx context.Context) bool {
+	v, _ := ctx.Value(unhurriedKey{}).(bool)
+	return v
+}
 
 // BookSearchProviders returns all enabled providers with the book_search capability.
 func (r *Registry) BookSearchProviders() []BookSearchProvider {
