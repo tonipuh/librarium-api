@@ -152,3 +152,18 @@ func TestLookupISBN_DeadlineStartsAfterFirstResult(t *testing.T) {
 		t.Fatalf("want the slow provider's result once it arrives, got %d results", len(out))
 	}
 }
+
+// A background enrichment has nobody waiting, so it must keep the answer of a
+// provider slower than the scan deadline rather than dropping it.
+func TestLookupISBN_UnhurriedWaitsForSlowProviders(t *testing.T) {
+	withISBNDeadline(t, 50*time.Millisecond)
+
+	r := NewRegistry()
+	r.Register(&fakeISBNProvider{name: "fast", delay: 0})
+	r.Register(&fakeISBNProvider{name: "paced", delay: 300 * time.Millisecond})
+
+	out := r.LookupISBN(Unhurried(context.Background()), "9780441172719")
+	if len(out) != 2 {
+		t.Fatalf("want both providers' results, got %+v", out)
+	}
+}

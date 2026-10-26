@@ -117,6 +117,10 @@ func (r *Registry) LookupISBN(ctx context.Context, isbn string) []*BookResult {
 	// 2026-08-17 as scan timeouts on both iOS and web during an Open Library
 	// outage; Open Library was hanging rather than refusing, so it burned its
 	// whole 15s on every scan.
+	//
+	// An Unhurried lookup skips the deadline and waits for every provider,
+	// each still bounded by its own HTTP timeout.
+	unhurried := isUnhurried(ctx)
 	var deadlineC <-chan time.Time
 
 	var out []*BookResult
@@ -128,7 +132,7 @@ func (r *Registry) LookupISBN(ctx context.Context, isbn string) []*BookResult {
 				out = append(out, res.book)
 			}
 			remaining--
-			if deadlineC == nil {
+			if deadlineC == nil && !unhurried {
 				deadline := time.NewTimer(isbnDeadline)
 				defer deadline.Stop()
 				deadlineC = deadline.C
@@ -155,6 +159,25 @@ func (r *Registry) LookupISBN(ctx context.Context, isbn string) []*BookResult {
 //
 // var, not const, so tests can shrink it rather than sleeping real seconds.
 var isbnDeadline = 3 * time.Second
+
+type unhurriedKey struct{}
+
+// Unhurried marks ctx as a lookup nobody is waiting on, such as a background
+// enrichment batch, so ISBN lookups wait for every provider rather than
+// cutting the slow ones off at isbnDeadline.
+//
+// The deadline is for a scan at the shelf. In a batch it drops exactly the
+// providers that pace themselves: several batches share Finna's one request a
+// second, its queue passes three seconds at once, and Finna then never
+// contributed to a batch at all.
+func Unhurried(ctx context.Context) context.Context {
+	return context.WithValue(ctx, unhurriedKey{}, true)
+}
+
+func isUnhurried(ctx context.Context) bool {
+	v, _ := ctx.Value(unhurriedKey{}).(bool)
+	return v
+}
 
 // BookSearchProviders returns all enabled providers with the book_search capability.
 func (r *Registry) BookSearchProviders() []BookSearchProvider {
