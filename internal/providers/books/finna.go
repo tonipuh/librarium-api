@@ -7,6 +7,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"image"
+	_ "image/jpeg" // registers the decoder for the cover probe
+	_ "image/png"
+	"io"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -42,6 +46,8 @@ type FinnaProvider struct {
 	// no user-supplied URL to validate — but a field rather than a const so
 	// tests can point it at an httptest server.
 	searchURL string
+	// coverShowURL is Finna's ISBN cover endpoint, a field for the same reason.
+	coverShowURL string
 
 	// minInterval spaces requests (see throttle). A field, not a const, so
 	// tests can shrink it instead of sleeping real seconds.
@@ -56,6 +62,20 @@ const finnaSearchBase = "https://api.finna.fi/v1/search"
 
 // finnaWebBase prefixes the record's relative cover image path.
 const finnaWebBase = "https://www.finna.fi"
+
+// finnaCoverShowBase is Finna's cover service. Asked by ISBN it finds a cover
+// for far more books than carry one in images[]: on a sample of Finnish books
+// with no images[] entry it had a real cover for 21 of 25.
+const finnaCoverShowBase = finnaWebBase + "/Cover/Show"
+
+// finnaCoverMinSide is the smallest width and height a Cover/Show answer may
+// have to count as a cover. The no-cover placeholder is a 1x1 GIF; the
+// smallest real covers are thumbnails a couple of hundred pixels wide.
+const finnaCoverMinSide = 50
+
+// finnaCoverProbeLimit caps how much of a Cover/Show answer is read to find its
+// format and size; the image header sits in the first few KB.
+const finnaCoverProbeLimit = 256 << 10
 
 // Finna's API terms ask for no more than roughly one request per second. A bulk
 // enrichment fans out a lookup per book, so without pacing Finna answers 429
@@ -72,10 +92,11 @@ func NewFinnaProvider() *FinnaProvider {
 		// Off by default, like every other optional provider — only Open Library
 		// ships on. Otherwise every install would send every ISBN lookup to Finna
 		// even for collections with no Finnish books; an admin turns it on.
-		base:        base{enabled: false},
-		client:      &http.Client{Timeout: 10 * time.Second},
-		searchURL:   finnaSearchBase,
-		minInterval: finnaDefaultInterval,
+		base:         base{enabled: false},
+		client:       &http.Client{Timeout: 10 * time.Second},
+		searchURL:    finnaSearchBase,
+		coverShowURL: finnaCoverShowBase,
+		minInterval:  finnaDefaultInterval,
 		// Finna rejects requests without a descriptive User-Agent (HTTP 403),
 		// so this is not optional politeness — the lookup fails without it.
 		userAgent: fmt.Sprintf("librarium-finna/%s (+https://github.com/fireball1725/librarium-api)", finnaVersion()),
@@ -151,7 +172,53 @@ func (p *FinnaProvider) LookupByISBN(ctx context.Context, isbn string) (*provide
 	}
 
 	rec := selectBestFinnaRecord(body.Records, isbn13, isbn10)
-	return finnaRecordToBookResult(rec, isbn13, isbn10), nil
+	result := finnaRecordToBookResult(rec, isbn13, isbn10)
+	if result.CoverURL == "" && isbn13 != "" {
+		result.CoverURL = p.coverByISBN(ctx, isbn13)
+	}
+	return result, nil
+}
+
+// coverByISBN asks Finna's cover service for the ISBN and returns the URL only
+// when the answer is a real cover. Cover/Show answers 200 with a 1x1
+// transparent GIF when it has no cover, and Librarium downloads and stores
+// whatever cover URL it is given, so the URL is never handed on unchecked: the
+// answer must decode as a JPEG or PNG at least finnaCoverMinSide on each side.
+// Any failure returns "" and leaves the cover for another provider to fill;
+// it never fails the lookup, whose metadata is already in hand.
+func (p *FinnaProvider) coverByISBN(ctx context.Context, isbn13 string) string {
+	if err := p.throttle(ctx); err != nil {
+		return ""
+	}
+	params := url.Values{}
+	params.Set("isbn", isbn13)
+	params.Set("size", "large")
+	coverURL := p.coverShowURL + "?" + params.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, coverURL, nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("User-Agent", p.userAgent)
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	cfg, format, err := image.DecodeConfig(io.LimitReader(resp.Body, finnaCoverProbeLimit))
+	if err != nil {
+		return ""
+	}
+	if format != "jpeg" && format != "png" {
+		return ""
+	}
+	if cfg.Width < finnaCoverMinSide || cfg.Height < finnaCoverMinSide {
+		return ""
+	}
+	return coverURL
 }
 
 // search performs the rate-limited, 429-aware GET. Every request first waits
@@ -436,14 +503,9 @@ func naturalName(s string) string {
 }
 
 // finnaCoverURL returns the record's own cover image, made absolute against
-// finna.fi. Returns "" when the record has no image.
-//
-// It deliberately does NOT fall back to Cover/Show?isbn=... . That endpoint
-// answers 200 with a 49-byte transparent placeholder GIF whenever Finna has no
-// cover for the ISBN, and since Librarium downloads and stores cover URLs, the
-// fallback poisoned the book with a blank image instead of leaving the cover
-// empty for another provider (or none) to fill. The record's images[] entry is
-// the only source that is a real cover when present.
+// finna.fi. Returns "" when the record has no image; LookupByISBN then tries
+// Cover/Show by ISBN through coverByISBN, which checks the answer is a real
+// cover rather than the blank placeholder that endpoint sends when it has none.
 func finnaCoverURL(r finnaRecord) string {
 	if len(r.Images) == 0 {
 		return ""
