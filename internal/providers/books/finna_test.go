@@ -4,7 +4,12 @@
 package books
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -58,6 +63,7 @@ func newTestFinnaProvider(t *testing.T, handler http.HandlerFunc) *FinnaProvider
 	t.Cleanup(srv.Close)
 	p := NewFinnaProvider()
 	p.searchURL = srv.URL
+	p.coverShowURL = srv.URL + "/Cover/Show"
 	p.minInterval = 0 // don't pace test requests
 	return p
 }
@@ -279,22 +285,90 @@ func TestFinnaProvider_LookupByISBN_ServerError(t *testing.T) {
 	}
 }
 
-func TestFinnaProvider_NoCoverWhenNoImage(t *testing.T) {
-	// No images[] means Finna has no cover. We must NOT synthesise a
-	// Cover/Show?isbn=... URL — it 200s with a blank placeholder that then gets
-	// stored as the book's cover.
-	p := newTestFinnaProvider(t, func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"resultCount":1,"status":"OK","records":[{
-			"title":"X","cleanIsbn":"9789510450741","isbns":["9789510450741"],
-			"formats":[{"value":"1/Book/Book/"}],"images":[]}]}`))
-	})
+// finnaNoImageRecord is a search reply whose record has no images[] entry, so
+// the lookup falls back to Cover/Show by ISBN.
+const finnaNoImageRecord = `{"resultCount":1,"status":"OK","records":[{
+	"title":"X","cleanIsbn":"9789510450741","isbns":["9789510450741"],
+	"formats":[{"value":"1/Book/Book/"}],"images":[]}]}`
 
-	got, err := p.LookupByISBN(context.Background(), "9789510450741")
+// finnaPlaceholderGIF is the 1x1 transparent GIF Cover/Show answers with,
+// status 200, when it has no cover for the ISBN.
+var finnaPlaceholderGIF, _ = base64.StdEncoding.DecodeString(
+	"R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7")
+
+func testJPEG(t *testing.T, w, h int) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for x := 0; x < w; x++ {
+		img.Set(x, 0, color.RGBA{R: 200, A: 255})
+	}
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, nil); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// newCoverShowProvider answers searches with finnaNoImageRecord and Cover/Show
+// with cover, recording the Cover/Show query it was sent.
+func newCoverShowProvider(t *testing.T, status int, cover []byte, gotQuery *string) *FinnaProvider {
+	t.Helper()
+	return newTestFinnaProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/Cover/Show" {
+			if gotQuery != nil {
+				*gotQuery = r.URL.RawQuery
+			}
+			w.WriteHeader(status)
+			_, _ = w.Write(cover)
+			return
+		}
+		_, _ = w.Write([]byte(finnaNoImageRecord))
+	})
+}
+
+func TestFinnaProvider_CoverShowByISBN(t *testing.T) {
+	var gotQuery string
+	p := newCoverShowProvider(t, http.StatusOK, testJPEG(t, 235, 333), &gotQuery)
+
+	got, err := p.LookupByISBN(context.Background(), "978-951-0-45074-1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got.CoverURL != "" {
-		t.Errorf("CoverURL = %q, want empty (no image on the record)", got.CoverURL)
+	if gotQuery != "isbn=9789510450741&size=large" {
+		t.Errorf("Cover/Show query = %q, want the ISBN-13 at size=large", gotQuery)
+	}
+	want := p.coverShowURL + "?isbn=9789510450741&size=large"
+	if got.CoverURL != want {
+		t.Errorf("CoverURL = %q, want %q", got.CoverURL, want)
+	}
+}
+
+func TestFinnaProvider_NoCoverFromCoverShow(t *testing.T) {
+	// Each of these is Cover/Show without a real cover. The URL must not be
+	// handed on: Librarium would download and store the blank as the cover.
+	cases := map[string]struct {
+		status int
+		body   []byte
+	}{
+		"placeholder gif": {http.StatusOK, finnaPlaceholderGIF},
+		"tiny jpeg":       {http.StatusOK, testJPEG(t, 10, 10)},
+		"not an image":    {http.StatusOK, []byte("<html>error</html>")},
+		"not found":       {http.StatusNotFound, nil},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			p := newCoverShowProvider(t, c.status, c.body, nil)
+			got, err := p.LookupByISBN(context.Background(), "9789510450741")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got == nil || got.Title != "X" {
+				t.Fatalf("got %+v, want the record's metadata despite no cover", got)
+			}
+			if got.CoverURL != "" {
+				t.Errorf("CoverURL = %q, want empty", got.CoverURL)
+			}
+		})
 	}
 }
 
